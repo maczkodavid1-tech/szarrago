@@ -1,0 +1,1788 @@
+
+**Cél:** Az **59** Zig/Futhark/Circom fájlt **egységes, működő rendszerré** drótozni a README.md (v40 spec) szerint. A repo most ~12 fájlt használ aktívan a treningben — a többi 47 fájl statikusan ott van, de nincs a futási path-okba bekötve. Ez a terv minden komponenst aktivál.
+
+
+---
+
+## 0. Sikerkritériumok (a teljes munka végén ezek mind igazak kell legyenek)
+
+1. `zig build` zöld, `zig build distributed-futhark -Dgpu=true` zöld.
+2. **Reverzibilitási teszt PASS:** minden új OFTB-vel kibővített RSF rétegre `inverse(forward(x)) == x` 1e-4 toleranciával.
+3. **Inference end-to-end működik:** `jaide-inference-server` indul, fogad HTTP POST `/inference` request-et, és a teljes pipeline-on átfut:
+   `MGT → LearnedEmbedding → RSF+OFTB×N → encodeInformation → NSIR → ReasoningOrchestrator → SurpriseMemory → SSI+Ranker → MGT detokenize`.
+4. **Training end-to-end működik:** `jaide-distributed-futhark` indul `WORLD_SIZE=1 RANK=0` esetén CPU-szinten lokálisan is, és:
+   - LearnedEmbedding van az RSF előtt (nem one-hot/identity).
+   - RSF+OFTB páros minden rétegen.
+   - SFD optimizer minden súlyt frissít (RSF + Embedding).
+   - Loss monoton csökken egy szintetikus 1 epoch-on (smoke-test).
+5. **ReasoningOrchestrator konvergál:** `E_combined < 0.01` egy szintetikus kis NSIR-en (4 node, 6 edge).
+6. **SurpriseMemory működik:** `combined_surprise = (jaccard + content_hash + temporal) / 3`, 24h newness ablak, evict alacsony-surprise blokkokat.
+7. **TemporalGraph snapshot:** minden NSIR állapotváltozás nanosec timestamp-pel jelölve, `getVersionAt` visszaadja a múltbeli állapotot.
+8. **VerifiedInferenceEngine optional bekapcsolható** `JAIDE_VERIFY=1` env-vel, Pedersen commitment + Merkle audit trail egy log fájlba (`/tmp/jaide_audit.log`).
+9. **CREV knowledge-graph builder** működik: training preprocessing során a `.jsonl` `text` mezőkből triplet-eket nyer ki és felépíti a `KnowledgeGraphIndex`-et.
+10. **Build artifact:** `IMPLEMENTATION_PLAN.md` checklist 100% pipálva.
+
+---
+
+## 1. Komponens-leltár (mind a 59 fájl, jelenlegi állapot + Phase besorolás)
+
+Sor: fájl, sorszám, állapot (active=most fut a `jaide-distributed-futhark` vagy `jaide-inference-server` binárisban; dormant=létezik de senki nem importálja; partial=létezik és valaki importálja, de nem teljes funkcióval), érintett Phase.
+
+| # | Fájl | Sor | Állapot | Phase |
+|---|------|-----|---------|-------|
+| 1 | `src/main_distributed_futhark.zig` | 245 | active | 1-5 |
+| 2 | `src/inference_server_main.zig` | 70 | active (inference) | 3 |
+| 3 | `src/api/inference_server.zig` | 689 | active (inference) | 3,5,6,7,8,9,10 |
+| 4 | `src/distributed/distributed_trainer_futhark.zig` | 1021 | active | 1,2,4 |
+| 5 | `src/distributed/gpu_coordinator.zig` | active | active | 1 |
+| 6 | `src/distributed/nccl_bindings.zig` | active | active | 1 |
+| 7 | `src/distributed/distributed_trainer.zig` | — | dormant (CPU fallback) | opt |
+| 8 | `src/distributed/modal_gpu.zig` | — | dormant (placeholder) | opt |
+| 9 | `src/hw/accel/accel_interface.zig` | 1210 | active | 1,2 |
+| 10 | `src/hw/accel/futhark_bindings.zig` | 285+ | active | 1,2 |
+| 11 | `src/hw/accel/cuda_bindings.zig` | active | active | 1 |
+| 12 | `src/hw/accel/main.fut` | 245 | active | 1,2 |
+| 13 | `src/hw/accel/futhark_kernels.fut` | active+dormant kernels | partial | 1,9 |
+| 14 | `src/hw/accel/fractal_lpu.zig` | 252 | **dormant** | 9 |
+| 15 | `src/processor/rsf.zig` | 1880 | active (Zig CPU side) | 1,5 |
+| 16 | `src/processor/oftb.zig` | 85 | **dormant** | 1 |
+| 17 | `src/core/learned_embedding.zig` | 150 | **dormant** | 2 |
+| 18 | `src/core/tensor.zig` | active | active | — |
+| 19 | `src/core/memory.zig` | active | active | — |
+| 20 | `src/core/types.zig` | active | active | — |
+| 21 | `src/core/io.zig` | active | active | — |
+| 22 | `src/core/model_io.zig` | 807 | partial (csak inference) | 1,2,4,6,7 |
+| 23 | `src/optimizer/sfd.zig` | 2545 | partial (csak inference) | 2 |
+| 24 | `src/tokenizer/mgt.zig` | 1288 | active | 1,2,3 |
+| 25 | `src/index/ssi.zig` | 808 | active (inference) | 3 |
+| 26 | `src/ranker/ranker.zig` | 1240 | active (inference) | 3 |
+| 27 | `src/core_relational/nsir_core.zig` | 1282 | partial (csak inference) | 3,4,5,6,7 |
+| 28 | `src/core_relational/mod.zig` | 384 | **dormant** (senki sem importálja) | 3 |
+| 29 | `src/core_relational/c_api.zig` | 1134 | **dormant** | 8 |
+| 30 | `src/core_relational/chaos_core.zig` | 1770 | **dormant** | 5 |
+| 31 | `src/core_relational/crev_pipeline.zig` | 1970 | **dormant** | 4 |
+| 32 | `src/core_relational/dataset_obfuscation.zig` | 808 | **dormant** | 8 (opt) |
+| 33 | `src/core_relational/esso_optimizer.zig` | 2107 | **dormant** | 5 |
+| 34 | `src/core_relational/fnds.zig` | 2314 | **dormant** | 9 (opt) |
+| 35 | `src/core_relational/formal_verification.zig` | 2781 | **dormant** | 8 |
+| 36 | `src/core_relational/ibm_quantum.zig` | 89 | **dormant** | 9 |
+| 37 | `src/core_relational/quantum_hardware.zig` | 2693 | **dormant** | 9 |
+| 38 | `src/core_relational/quantum_logic.zig` | 1346 | **dormant** | 9 |
+| 39 | `src/core_relational/quantum_task_adapter.zig` | 427 | **dormant** | 9 |
+| 40 | `src/core_relational/r_gpu.zig` | 1684 | **dormant** | 9 |
+| 41 | `src/core_relational/reasoning_orchestrator.zig` | 524 | **dormant** | 5 |
+| 42 | `src/core_relational/safety.zig` | 373 | **dormant** | 10 |
+| 43 | `src/core_relational/security_proofs.zig` | 3577 | **dormant** | 8 |
+| 44 | `src/core_relational/signal_propagation.zig` | 399 | **dormant** | 10 |
+| 45 | `src/core_relational/surprise_memory.zig` | 708 | **dormant** | 6 |
+| 46 | `src/core_relational/temporal_graph.zig` | 1781 | **dormant** | 7 |
+| 47 | `src/core_relational/type_theory.zig` | 4341 | **dormant** | 8 |
+| 48 | `src/core_relational/verified_inference_engine.zig` | 689 | **dormant** | 8 |
+| 49 | `src/core_relational/vpu.zig` | 1992 | **dormant** | opt |
+| 50 | `src/core_relational/z_runtime.zig` | 1327 | **dormant** | 10 |
+| 51 | `src/core_relational/zk_verification.zig` | 1404 | **dormant** | 8 |
+| 52 | `src/zk/inference_trace.circom` | 847 | **dormant** | 8 |
+| 53 | `src/_bench_deps.zig` | — | active (bench) | — |
+| 54 | `src/tests/bench_matmul.zig` | — | active (bench) | — |
+| 55 | `src/tests/bench_rsf.zig` | — | active (bench) | 1 |
+| 56 | `src/tests/bench_sfd.zig` | — | active (bench) | — |
+| 57 | `src/tests/bench_tensor_ops.zig` | — | active (bench) | — |
+| 58 | `src/tests/stress_tensor_refcount.zig` | — | active (bench) | — |
+| 59 | `build.zig` | 105 | active | minden |
+
+Megjegyzés: a `processor/rsf.zig` Zig-CPU implementáció (1880 sor) tartalmaz egy második, párhuzamos forward path-ot. **A treningben a Futhark `main.fut` fut, nem a Zig RSF.** Az inference server az RSF Zig CPU path-ot használja. **Mindkettőre be kell drótozni az OFTB-t** (Phase 1).
+
+---
+
+## 2. Pipeline-architektúra (mit drótozunk össze)
+
+### 2.1 Inference pipeline (`InferenceServer.handleInference`)
+
+```
+HTTP POST /inference (JSON: { "input": "...", "max_tokens": N })
+    │
+    ▼
+[1] MGT.encode(text)                          src/tokenizer/mgt.zig:296
+    └─→ token_ids: []u32
+    ▼
+[2] LearnedEmbedding.forward(token_ids)       src/core/learned_embedding.zig:38
+    └─→ activation: Tensor [seq_len, dim]    (f32)
+    ▼
+[3] RSF + OFTB ×N rétegek                     src/processor/rsf.zig (CPU) / src/hw/accel/main.fut (GPU)
+    │   layer i:
+    │     RSFLayer.forwardInPlace(x1, x2)     coupling (s/t/sbias/tbias)
+    │     OFTB.forwardInPlace(x)              butterfly (1/√2 keverő)
+    └─→ final_activation: Tensor [seq_len, dim]
+    ▼
+[4] encodeInformation(activation) → NSIR      src/core_relational/nsir_core.zig
+    │   (a) minden timestep-hez új Node az NSIR-be (qubit ~ activation L2 norma)
+    │   (b) él-súlyok ~ cos(timestep distance)
+    └─→ graph: *SelfSimilarRelationalGraph
+    ▼
+[5] CREV — opcionális szöveges triplet hozzáadás   src/core_relational/crev_pipeline.zig
+    │   ha config.enable_crev_at_inference == true:
+    │     CREVPipeline.processBatch(text)
+    │     → RelationalTriplet-ek → KnowledgeGraphIndex.absorb(graph)
+    ▼
+[6] ReasoningOrchestrator.runHierarchicalReasoning()  src/core_relational/reasoning_orchestrator.zig
+    │   loop:
+    │     local = executeLocalPhase()
+    │     global = executeGlobalPhase()
+    │     meta = executeMetaPhase()
+    │     E_combined = (local + global + meta) / 3
+    │     if E_combined < 0.01 → break
+    │   ESSO simulated annealing belülről hívva, 7 symmetry group
+    ▼
+[7] SurpriseMemoryManager.consider(activation, graph)  src/core_relational/surprise_memory.zig
+    │   blocks_kept = filter(combined_surprise > threshold)
+    │   blocks_evicted = filter(combined_surprise < threshold AND age > 24h)
+    ▼
+[8] TemporalGraph.snapshot(graph)             src/core_relational/temporal_graph.zig
+    │   timestamp = std.time.nanoTimestamp()
+    │   minden Node/Edge → új TemporalNode/EdgeVersion entry
+    ▼
+[9] SSI.retrieveTopK(query_tokens, K)         src/index/ssi.zig:309
+    │   K = 32 (default)
+    └─→ candidates: []RankedSegment
+    ▼
+[10] Ranker.topKHeap(ssi, query_tokens, 1)    src/ranker/ranker.zig:387
+    │   n-gram súlyok + Jaccard + anchor proximity
+    └─→ best_segment: RankedSegment
+    ▼
+[11] next_token = best_segment.tokens[0]
+    ▼
+[12] (loop 1-11) max_tokens-szer
+    ▼
+[13] MGT.decode(generated_tokens) → response text
+    ▼
+HTTP 200 { "output": "..." }
+```
+
+Verification réteg (Phase 8), opcionális, `JAIDE_VERIFY=1` esetén minden inference-re fut:
+```
+input_bytes ──→ Pedersen.commit ──→ input_commitment
+output_bytes ─→ Pedersen.commit ──→ output_commitment
+TypeTheory.check(activation type)   ──→ TypeChecker ok?
+FormalVerification.checkHoare(pre, post, body) → ok?
+ZkVerification.generateProof(input, output, model_hash) → Groth16Proof
+SecurityProofs.appendAudit(merkle_tree, hash_chain) → audit_entry
+→ JAIDE_AUDIT_LOG fájlba JSON-line entry
+```
+
+### 2.2 Training pipeline (`DistributedTrainerFuthark.trainEpoch`)
+
+```
+JSONL dataset
+    ▼
+[0] (opcionális, ha env JAIDE_BUILD_KG=1):
+    CREVPipeline.processBatch(text) → triplets → KnowledgeGraphIndex
+    (sajátos preprocessing lépés a training előtt)
+    ▼
+batch sample loop:
+    ▼
+[1] MGT.encode(text) → token_ids
+    ▼
+[2] LearnedEmbedding.forward(token_ids) → activation (f32)
+    │   .cast(f16) → activation_f16
+    ▼
+[3] Forward: minden réteghez:
+    │   Futhark rsf_forward
+    │   Futhark oftb_forward
+    │   cache: activation_after_layer[i] (a backprop-hoz)
+    ▼
+[4] batch_compute_loss(final_activation, target) → loss (f32 accumulator)
+    ▼
+[5] compute_initial_grad_l2(final_activation, target) → grad
+    ▼
+[6] Backward: minden réteghez (N-1 → 0):
+    │   Futhark oftb_backward
+    │   Futhark batch_gradients_full → (grad_ws, grad_wt, grad_sb, grad_tb, grad_input)
+    │   Futhark sfd_update_half(weights, grad_ws, lr, momentum, velocity)
+    │   grad = grad_input
+    ▼
+[7] LearnedEmbedding.backward(token_ids, grad)
+    │   LearnedEmbedding.applyGradients(lr, momentum)
+    ▼
+[8] AllReduce (csak ha world_size > 1):
+    │   GPUCoordinator.allReduceFloat16Avg minden súlyon
+    ▼
+[9] Step counter++; ha step % checkpoint_every == 0:
+    │   model_io.exportModel(path)
+```
+
+### 2.3 Knowledge-graph builder pipeline (`CREVPipeline.processCorpus`, training preprocessing)
+
+```
+JSONL dataset text mezők
+    ▼
+CREVPipeline.processBatch(text):
+    [1] Tokenization (saját, MGT-től független, mert relációs nem morfológiai)
+    [2] RelationPattern matching (alany-reláció-tárgy)
+    [3] Validation (konfidencia + ütközés-ellenőrzés)
+    [4] Integration: SHA-256 dedup
+    [5] Indexing: KnowledgeGraphIndex.add(triplet)
+    ▼
+KnowledgeGraphIndex
+    ▼
+RelationalTriplet[] → graph.addNode + graph.addEdge (NSIR populated)
+    ▼
+Inference végén ReasoningOrchestrator EZEN A GRÁFON futtat ESSO-t
+```
+
+---
+
+## 3. Build-rendszer terv (`build.zig` változtatások)
+
+`build.zig` (105 sor) jelenleg csak `futhark_kernels.c` és `main_gpu.c`-t fordítja. Új lépések:
+
+```zig
+// build.zig — új lépések a meglévő pub fn build(b: *std.Build) végére
+
+// 3.1 core_relational mint külön modul
+const core_relational_mod = b.createModule(.{
+    .root_source_file = b.path("src/core_relational/mod.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+core_relational_mod.addOptions("build_options", build_options);
+
+// 3.2 inference_server_exe-hez hozzáadás
+inference_server_exe.root_module.addImport("core_relational", core_relational_mod);
+
+// 3.3 distributed_futhark_exe-hez hozzáadás (csak ha gpu_enabled)
+if (gpu_enabled) {
+    distributed_futhark_exe.root_module.addImport("core_relational", core_relational_mod);
+}
+
+// 3.4 Új teszt targetek
+const test_targets = [_]struct { name: []const u8, path: []const u8 }{
+    .{ .name = "test-rsf", .path = "src/processor/rsf.zig" },
+    .{ .name = "test-oftb", .path = "src/processor/oftb.zig" },
+    .{ .name = "test-embedding", .path = "src/core/learned_embedding.zig" },
+    .{ .name = "test-nsir", .path = "src/core_relational/nsir_core.zig" },
+    .{ .name = "test-reasoning", .path = "src/core_relational/reasoning_orchestrator.zig" },
+    .{ .name = "test-crev", .path = "src/core_relational/crev_pipeline.zig" },
+    .{ .name = "test-surprise", .path = "src/core_relational/surprise_memory.zig" },
+    .{ .name = "test-temporal", .path = "src/core_relational/temporal_graph.zig" },
+};
+const test_all_step = b.step("test-all", "Run all unit tests");
+inline for (test_targets) |t| {
+    const test_exe = b.addTest(.{
+        .root_source_file = b.path(t.path),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_exe.linkLibC();
+    test_exe.addCSourceFile(.{ .file = futhark_c, .flags = &.{"-O2"} });
+    test_exe.addIncludePath(futhark_include);
+    test_exe.root_module.addOptions("build_options", build_options);
+    test_exe.root_module.addImport("core_relational", core_relational_mod);
+    const run_test = b.addRunArtifact(test_exe);
+    const step = b.step(t.name, t.name);
+    step.dependOn(&run_test.step);
+    test_all_step.dependOn(&run_test.step);
+}
+
+// 3.5 Új Futhark entrypoint-ok beadása (a futhark_kernels.c regenerálva kell legyen
+// a main.fut alapján — minden új `entry` automatikusan elérhető lesz). A C wrapper-t
+// a Replit agent NE regenerálja kézzel — futtassa: `futhark c src/hw/accel/main.fut -o src/hw/accel/futhark_kernels.c`
+// (és GPU verzió: `futhark cuda src/hw/accel/main.fut -o src/hw/accel/main_gpu.c`).
+```
+
+---
+
+## 4. Fázis 1 — OFTB butterfly bedrótozása RSF mellé
+
+**Cél:** Minden RSF coupling réteg után OFTB butterfly transform fusson, ahogy a README:1072-1076 előírja.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/hw/accel/main.fut` | új `oftb_forward`, `oftb_backward` entry-k; `batch_forward` és `batch_gradients_full` átírása |
+| `src/hw/accel/futhark_bindings.zig` | új C-binding deklarációk az új entry-khez |
+| `src/hw/accel/accel_interface.zig` | `RSFAccelerator.forward` és `trainingStep` átírás: OFTB hívás minden réteg után |
+| `src/processor/rsf.zig` | Zig CPU RSF `forward`/`backward` átírás: OFTB hívás minden réteg után |
+| `src/processor/oftb.zig` | nincs változás (kész) |
+
+### 4.1 `src/hw/accel/main.fut` — új OFTB Futhark kernel
+
+A jelenlegi 245 soros fájl végére hozzáadni:
+
+```futhark
+-- OFTB butterfly transform: in-place Hadamard-szerű keverő
+-- x = [x1 | x2] (mindkettő [half] f16)
+-- y1 = (x1 - x2) / sqrt(2)
+-- y2 = (x1 + x2) / sqrt(2)
+-- Reverzibilis: inverse_oftb(oftb(x)) == x
+
+let oftb_forward_single [half] (input: [half*2]f16) : [half*2]f16 =
+  let d = half * 2
+  let inv_sqrt2 = f16.f32 (1.0f32 / f32.sqrt 2.0f32)
+  let x1 = input[0:half] :> [half]f16
+  let x2 = input[half:d] :> [half]f16
+  let y1 = map2 (\a b -> (a f16.- b) f16.* inv_sqrt2) x1 x2
+  let y2 = map2 (\a b -> (a f16.+ b) f16.* inv_sqrt2) x1 x2
+  in (y1 ++ y2) :> [half*2]f16
+
+let oftb_backward_single [half] (grad: [half*2]f16) : [half*2]f16 =
+  let d = half * 2
+  let inv_sqrt2 = f16.f32 (1.0f32 / f32.sqrt 2.0f32)
+  let g1 = grad[0:half] :> [half]f16
+  let g2 = grad[half:d] :> [half]f16
+  -- A forward Jacobian-ja egy önadjungált ortogonális mátrix (× 1/sqrt(2)),
+  -- tehát a backward ugyanaz a forma, csak a két komponens szerepe felcserélve:
+  -- dx1 = (g1 + g2) / sqrt(2)
+  -- dx2 = (g2 - g1) / sqrt(2)
+  let dx1 = map2 (\a b -> (a f16.+ b) f16.* inv_sqrt2) g1 g2
+  let dx2 = map2 (\a b -> (b f16.- a) f16.* inv_sqrt2) g1 g2
+  in (dx1 ++ dx2) :> [half*2]f16
+
+entry oftb_forward [n][half] (input: [n][half*2]f16) : *[n][half*2]f16 =
+  map oftb_forward_single input
+
+entry oftb_backward [n][half] (grad: [n][half*2]f16) : *[n][half*2]f16 =
+  map oftb_backward_single grad
+
+entry batch_oftb_forward [batch_size][seq_len][half]
+  (inputs: [batch_size][seq_len][half*2]f16) : *[batch_size][seq_len][half*2]f16 =
+  map oftb_forward inputs
+
+entry batch_oftb_backward [batch_size][seq_len][half]
+  (grads: [batch_size][seq_len][half*2]f16) : *[batch_size][seq_len][half*2]f16 =
+  map oftb_backward grads
+```
+
+**FONTOS:** a meglévő `batch_forward` és `batch_gradients_full` entry-k változatlanok maradnak. Az OFTB-t a Zig oldal hívja explicit külön entry-ként minden réteg után. Ez tisztább, mint a `batch_forward`-be befonva.
+
+Miután mentve, a Replit agent futtassa:
+```bash
+cd /home/runner/jaidellm
+futhark c src/hw/accel/main.fut -o src/hw/accel/futhark_kernels.c
+# Ha GPU is van:
+futhark cuda src/hw/accel/main.fut -o src/hw/accel/main_gpu.c
+```
+
+### 4.2 `src/hw/accel/futhark_bindings.zig` — új C-binding deklarációk
+
+A fájl `extern fn`-jei közé (a `futhark_entry_rsf_forward` után, ~120. sor körül) hozzáadni:
+
+```zig
+pub extern "c" fn futhark_entry_oftb_forward(
+    ctx: ?*struct_futhark_context,
+    out0: *?*struct_futhark_f16_2d,
+    in0: ?*struct_futhark_f16_2d,
+) callconv(.c) c_int;
+
+pub extern "c" fn futhark_entry_oftb_backward(
+    ctx: ?*struct_futhark_context,
+    out0: *?*struct_futhark_f16_2d,
+    in0: ?*struct_futhark_f16_2d,
+) callconv(.c) c_int;
+
+pub extern "c" fn futhark_entry_batch_oftb_forward(
+    ctx: ?*struct_futhark_context,
+    out0: *?*struct_futhark_f16_3d,
+    in0: ?*struct_futhark_f16_3d,
+) callconv(.c) c_int;
+
+pub extern "c" fn futhark_entry_batch_oftb_backward(
+    ctx: ?*struct_futhark_context,
+    out0: *?*struct_futhark_f16_3d,
+    in0: ?*struct_futhark_f16_3d,
+) callconv(.c) c_int;
+```
+
+### 4.3 `src/hw/accel/accel_interface.zig` — `forward` átírás OFTB-vel
+
+A `RSFAccelerator.forward` (628. sortól) `while (li < self.layers.len)` ciklusát módosítani:
+
+**Régi forward ciklus (~644-672. sor):**
+```zig
+var li: usize = 0;
+while (li < self.layers.len) : (li += 1) {
+    const layer = &self.layers[li];
+    // ... NULL check ...
+    var next_arr: ?*futhark.struct_futhark_f16_2d = null;
+    const result = futhark.futhark_entry_rsf_forward(...);
+    if (result != 0) return AccelError.FutharkForwardFailed;
+    if (li > 0) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, current_arr);
+    current_arr = next_arr;
+}
+```
+
+**Új forward ciklus:**
+```zig
+var li: usize = 0;
+while (li < self.layers.len) : (li += 1) {
+    const layer = &self.layers[li];
+    // ... NULL check változatlan ...
+
+    // 1. Coupling layer (RSF)
+    var coupling_out: ?*futhark.struct_futhark_f16_2d = null;
+    {
+        const result = futhark.futhark_entry_rsf_forward(
+            self.ctx.ctx, &coupling_out,
+            current_arr,
+            layer.weights_s.arr, layer.weights_t.arr,
+            layer.s_bias.arr, layer.t_bias.arr,
+            clip_min_bits, clip_max_bits,
+        );
+        if (result != 0) {
+            if (li > 0) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, current_arr);
+            return AccelError.FutharkForwardFailed;
+        }
+        if (coupling_out == null) {
+            if (li > 0) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, current_arr);
+            return AccelError.NullPointer;
+        }
+    }
+
+    // 2. OFTB butterfly (Phase 1 — README:1072-1076)
+    var oftb_out: ?*futhark.struct_futhark_f16_2d = null;
+    {
+        const result = futhark.futhark_entry_oftb_forward(
+            self.ctx.ctx, &oftb_out, coupling_out,
+        );
+        if (result != 0) {
+            _ = futhark.futhark_free_f16_2d(self.ctx.ctx, coupling_out);
+            if (li > 0) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, current_arr);
+            return AccelError.FutharkForwardFailed;
+        }
+        _ = futhark.futhark_free_f16_2d(self.ctx.ctx, coupling_out);
+    }
+
+    if (li > 0) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, current_arr);
+    current_arr = oftb_out;
+}
+```
+
+### 4.4 `RSFAccelerator.trainingStep` — forward + backward chain OFTB-vel
+
+A `trainingStep` (687. sortól) forward loop-ot módosítani: minden réteg után batch_oftb_forward.
+
+**Új forward loop (a meglévő `// ----- Forward pass -----` szakasz átírása, ~726. sor):**
+
+```zig
+var li: usize = 0;
+while (li < n_layers) : (li += 1) {
+    const layer = &self.layers[li];
+
+    // 1. Coupling
+    var coupling_out: ?*futhark.struct_futhark_f16_3d = null;
+    {
+        const result = futhark.futhark_entry_batch_forward(
+            self.ctx.ctx, &coupling_out,
+            activations[li],
+            layer.weights_s.arr, layer.weights_t.arr,
+            layer.s_bias.arr, layer.t_bias.arr,
+            clip_min_bits, clip_max_bits,
+        );
+        if (result != 0) return AccelError.FutharkForwardFailed;
+        if (coupling_out == null) return AccelError.NullPointer;
+    }
+
+    // 2. OFTB butterfly
+    var oftb_out: ?*futhark.struct_futhark_f16_3d = null;
+    {
+        const result = futhark.futhark_entry_batch_oftb_forward(
+            self.ctx.ctx, &oftb_out, coupling_out,
+        );
+        _ = futhark.futhark_free_f16_3d(self.ctx.ctx, coupling_out);
+        if (result != 0) return AccelError.FutharkForwardFailed;
+        if (oftb_out == null) return AccelError.NullPointer;
+    }
+
+    activations[li + 1] = oftb_out;
+    owned[li + 1] = true;
+}
+```
+
+**Új backward loop:** A jelenlegi backward (~830-940. sor) az utolsó réteg gradiensét veszi és visszafelé halad. Minden lépés:
+
+1. **OFTB backward** (a `grad` output -ját kapja, és visszaadja a coupling-output gradiensét),
+2. **batch_gradients_full** a coupling rétegre.
+
+```zig
+// (a jelenlegi backward loop fejéhez, mielőtt grad_output-ot átadnánk batch_gradients_full-nak)
+var bi: usize = n_layers;
+var grad_arr: ?*futhark.struct_futhark_f16_3d = initial_grad;
+while (bi > 0) {
+    bi -= 1;
+    const layer = &self.layers[bi];
+
+    // 1. OFTB backward: a grad_arr az OFTB output-jának grad-ja, megfordítjuk a coupling output-jának grad-jává
+    var coupling_grad: ?*futhark.struct_futhark_f16_3d = null;
+    {
+        const result = futhark.futhark_entry_batch_oftb_backward(
+            self.ctx.ctx, &coupling_grad, grad_arr,
+        );
+        if (bi < n_layers - 1) _ = futhark.futhark_free_f16_3d(self.ctx.ctx, grad_arr);
+        // (ha bi == n_layers-1, akkor grad_arr az initial_grad, NEM felszabadítani — az másik útvonalon felszabadul)
+        if (result != 0) return AccelError.FutharkBackwardFailed;
+    }
+
+    // 2. batch_gradients_full hívása a coupling-output-ra
+    // (a meglévő hívás változatlan, csak grad_outputs paraméter helyett coupling_grad-ot adunk)
+    // ... a meglévő logika, ami visszaad (grad_ws, grad_wt, grad_sb, grad_tb, grad_input)
+    // grad_arr = grad_input
+}
+```
+
+**FONTOS:** az OFTB-nek nincs súlya, így nincs gradiens-frissítés rá. Csak gradiens-átengedés.
+
+### 4.5 `src/processor/rsf.zig` — Zig CPU side OFTB integráció
+
+A `RSF.forward` (1350. sortól) ciklusát módosítani. A jelenlegi:
+
+```zig
+pub fn forward(self: *RSF, x: *Tensor) !void {
+    // ... gpu check ...
+    for (self.layers, 0..) |*layer, i| {
+        _ = i;
+        try layer.forward(...);
+    }
+}
+```
+
+**Új:**
+
+```zig
+const OFTB = @import("oftb.zig").OFTB;
+
+pub fn forward(self: *RSF, x: *Tensor) !void {
+    if (self.layers.len == 0) return error.NoLayers;
+    if (x.shape.len < 1) return error.InvalidShape;
+    const dim = x.shape[x.shape.len - 1];
+    if (dim % 2 != 0) return error.InvalidShape;
+    const half = dim / 2;
+    const oftb = OFTB.init(half);
+
+    // Split x into x1, x2 views for coupling, then re-pack for OFTB, repeat per layer.
+    // (A részletes split/pack logika a meglévő RSFLayer.forward signature-jétől függ —
+    // a CPU path-ban a layer.forward(x1, x2) -t hívja, az OFTB pedig az össze-pakkolt
+    // x-en operál. A Zig CPU path-on egy egyszerű buffer copy + view-mix kell.)
+
+    for (self.layers) |*layer| {
+        // 1. Coupling
+        const x1_ptr = x.data[0..half];
+        const x2_ptr = x.data[half..][0..half];
+        var x1_view = try makeTensorView(x.allocator, x1_ptr, &.{ 1, half });
+        defer x1_view.deinit();
+        var x2_view = try makeTensorView(x.allocator, x2_ptr, &.{ 1, half });
+        defer x2_view.deinit();
+        try layer.forward(&x1_view, &x2_view);
+
+        // 2. OFTB butterfly
+        try oftb.forwardInPlace(x);
+    }
+}
+```
+
+A `makeTensorView` egy új helper kell legyen `tensor.zig`-be vagy in-place a fenti függvénybe — egy `Tensor` ami nem owner-je a memóriának, csak nyúz.
+
+Hasonló módosítás kell `RSF.inverse` és `RSF.backward`-be:
+- `inverse`: minden réteg után `oftb.backwardInPlace` (az OFTB ortogonális, az inverze a backwardja).
+- `backward`: minden gradiens lépés előtt `oftb.backwardInPlace(grad)`.
+
+### 4.6 Tesztelés (Phase 1)
+
+```bash
+cd /home/runner/jaidellm
+zig build test-oftb     # OFTB unit teszt
+zig build test-rsf      # RSF unit teszt — reverzibilitás OFTB-vel
+zig build -Dgpu=true    # GPU build (csak ha CUDA elérhető)
+zig build distributed-futhark -Dgpu=true
+```
+
+**Új unit teszt `src/processor/rsf.zig` végére:**
+
+```zig
+test "RSF forward+OFTB reversibility (CPU)" {
+    const allocator = std.testing.allocator;
+    var rsf = try RSF.init(allocator, 8, 4);  // dim=8, 4 layer
+    defer rsf.deinit();
+
+    var x = try Tensor.init(allocator, &.{ 1, 8 });
+    defer x.deinit();
+    for (x.data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.1;
+
+    var x_orig = try x.clone();
+    defer x_orig.deinit();
+
+    try rsf.forward(&x);
+    try rsf.inverse(&x);
+
+    for (x.data, 0..) |v, i| {
+        try std.testing.expectApproxEqAbs(x_orig.data[i], v, 1e-4);
+    }
+}
+```
+
+**Phase 1 sikerkritériuma:** ez a teszt PASS és `zig build` zöld.
+
+---
+
+## 5. Fázis 2 — LearnedEmbedding bedrótozása
+
+**Cél:** A `token_id → embedding vektor` átalakítás aktív legyen a training és inference path-ban.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/core/learned_embedding.zig` | bug-fix a `forward`-ban (lásd 5.1) |
+| `src/hw/accel/main.fut` | új `embedding_forward`, `embedding_backward`, `embedding_update` entry-k |
+| `src/hw/accel/futhark_bindings.zig` | új C-binding deklarációk |
+| `src/hw/accel/accel_interface.zig` | új `EmbeddingAccelerator` struct |
+| `src/distributed/distributed_trainer_futhark.zig` | embedding bedrótozás |
+| `src/api/inference_server.zig` | embedding bedrótozás |
+| `src/core/model_io.zig` | embedding checkpoint mentés |
+
+### 5.1 `src/core/learned_embedding.zig` — bug-fix
+
+A jelenlegi `forward` (38. sor) implementáció hibás: a `max_tokens = @min(tokens.len, self.dim)` rossz (a `dim` az embedding dimenziója, nem a max token-szám). Helyes:
+
+```zig
+pub fn forward(self: *LearnedEmbedding, allocator: Allocator, tokens: []const u32, max_seq_len: usize) !Tensor {
+    const seq_len = @min(tokens.len, max_seq_len);
+    var out = try Tensor.init(allocator, &.{ seq_len, self.dim });
+    @memset(out.data, 0.0);
+    var r: usize = 0;
+    while (r < seq_len) : (r += 1) {
+        const t = @min(@as(usize, tokens[r]), self.vocab_size - 1);
+        const src_offset = t * self.dim;
+        const dst_offset = r * self.dim;
+        @memcpy(out.data[dst_offset..dst_offset + self.dim],
+                self.weight.data[src_offset..src_offset + self.dim]);
+    }
+    return out;
+}
+
+pub fn backward(self: *LearnedEmbedding, tokens: []const u32, out_grad: []const f32, seq_len: usize) void {
+    var r: usize = 0;
+    while (r < seq_len) : (r += 1) {
+        const t = @min(@as(usize, tokens[r]), self.vocab_size - 1);
+        const src_offset = r * self.dim;
+        const dst_offset = t * self.dim;
+        var c: usize = 0;
+        while (c < self.dim) : (c += 1) {
+            self.grad.data[dst_offset + c] += out_grad[src_offset + c];
+        }
+    }
+}
+```
+
+### 5.2 `src/hw/accel/main.fut` — új embedding kernelek
+
+Hozzáadni a fájl végéhez:
+
+```futhark
+-- LearnedEmbedding forward: token_ids → embedding vectors
+-- weight: [vocab_size, dim]
+-- tokens: [seq_len] (u32 értékek)
+-- output: [seq_len, dim]
+
+entry embedding_forward [vocab_size][dim][seq_len]
+  (weight: [vocab_size][dim]f16) (tokens: [seq_len]u32)
+  : *[seq_len][dim]f16 =
+  map (\t ->
+    let idx = u32.max 0 (u32.min t (u32.i64 (vocab_size - 1)))
+    let idx_i64 = i64.u32 idx
+    in weight[idx_i64]
+  ) tokens
+
+-- Embedding backward: out_grad [seq_len, dim] → embedding_grad [vocab_size, dim]
+-- Több token ugyanarra a row-ra mutathat, ezért scatter-add szükséges.
+entry embedding_backward [vocab_size][dim][seq_len]
+  (tokens: [seq_len]u32) (out_grad: [seq_len][dim]f16)
+  : *[vocab_size][dim]f16 =
+  let zero_grad = replicate vocab_size (replicate dim (f16.i32 0))
+  in loop g = zero_grad for r < seq_len do
+    let idx = u32.min tokens[r] (u32.i64 (vocab_size - 1))
+    let idx_i64 = i64.u32 idx
+    let updated_row = map2 (\old new -> old f16.+ new) g[idx_i64] out_grad[r]
+    in g with [idx_i64] = updated_row
+
+-- Embedding SGD update
+entry embedding_update [vocab_size][dim]
+  (weight: *[vocab_size][dim]f16) (grad: [vocab_size][dim]f16)
+  (lr: f16) (momentum: f16) (velocity: *[vocab_size][dim]f16)
+  : (*[vocab_size][dim]f16, *[vocab_size][dim]f16) =
+  let new_velocity = map2 (map2 (\v g -> momentum f16.* v f16.+ lr f16.* g)) velocity grad
+  let new_weight = map2 (map2 (\w v -> w f16.- v)) weight (copy new_velocity)
+  in (new_weight, new_velocity)
+```
+
+**FONTOS:** ezután futtatni: `futhark c src/hw/accel/main.fut -o src/hw/accel/futhark_kernels.c` és `futhark cuda src/hw/accel/main.fut -o src/hw/accel/main_gpu.c`.
+
+### 5.3 `src/hw/accel/futhark_bindings.zig` — új C-binding-ek
+
+```zig
+pub extern "c" fn futhark_entry_embedding_forward(
+    ctx: ?*struct_futhark_context,
+    out0: *?*struct_futhark_f16_2d,
+    weight: ?*struct_futhark_f16_2d,
+    tokens: ?*struct_futhark_u32_1d,
+) callconv(.c) c_int;
+
+pub extern "c" fn futhark_entry_embedding_backward(
+    ctx: ?*struct_futhark_context,
+    out0: *?*struct_futhark_f16_2d,
+    tokens: ?*struct_futhark_u32_1d,
+    out_grad: ?*struct_futhark_f16_2d,
+) callconv(.c) c_int;
+
+pub extern "c" fn futhark_entry_embedding_update(
+    ctx: ?*struct_futhark_context,
+    out_weight: *?*struct_futhark_f16_2d,
+    out_velocity: *?*struct_futhark_f16_2d,
+    weight: ?*struct_futhark_f16_2d,
+    grad: ?*struct_futhark_f16_2d,
+    lr: u16,
+    momentum: u16,
+    velocity: ?*struct_futhark_f16_2d,
+) callconv(.c) c_int;
+```
+
+Plusz egy új opaque típus a u32_1d-hez ha még nincs:
+```zig
+pub const struct_futhark_u32_1d = opaque {};
+```
+
+### 5.4 `src/hw/accel/accel_interface.zig` — `EmbeddingAccelerator` struct
+
+A fájl végére (a `RSFAccelerator` után, ~1140. sor):
+
+```zig
+pub const EmbeddingAccelerator = struct {
+    ctx: *FutharkContext,
+    weight: FutharkArray2DF16,
+    velocity: FutharkArray2DF16,
+    vocab_size: usize,
+    dim: usize,
+
+    pub fn init(ctx: *FutharkContext, vocab_size: usize, dim: usize, allocator: std.mem.Allocator) AccelError!EmbeddingAccelerator {
+        // Init weight kis random értékkel (0.02 std), velocity nullával.
+        const total = vocab_size * dim;
+        const buf = try allocator.alloc(f16, total);
+        defer allocator.free(buf);
+        var prng = std.Random.DefaultPrng.init(42);
+        const rng = prng.random();
+        for (buf) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 0.02);
+
+        const weight = try FutharkArray2DF16.newFromFlat(ctx, buf, vocab_size, dim);
+        const velocity = try FutharkArray2DF16.newZeros(ctx, vocab_size, dim);
+        return .{
+            .ctx = ctx,
+            .weight = weight,
+            .velocity = velocity,
+            .vocab_size = vocab_size,
+            .dim = dim,
+        };
+    }
+
+    pub fn deinit(self: *EmbeddingAccelerator) void {
+        self.weight.free(self.ctx);
+        self.velocity.free(self.ctx);
+    }
+
+    pub fn forward(self: *EmbeddingAccelerator, tokens_u32: []const u32, allocator: std.mem.Allocator) AccelError!FutharkArray2DF16 {
+        const tokens_arr = try FutharkArray1DU32.newFromFlat(self.ctx, tokens_u32, tokens_u32.len);
+        defer tokens_arr.free(self.ctx);
+        var out: ?*futhark.struct_futhark_f16_2d = null;
+        const result = futhark.futhark_entry_embedding_forward(
+            self.ctx.ctx, &out, self.weight.arr, tokens_arr.arr,
+        );
+        if (result != 0) return AccelError.FutharkForwardFailed;
+        return FutharkArray2DF16{ .arr = out, .rows = tokens_u32.len, .cols = self.dim };
+    }
+
+    pub fn backwardAndUpdate(self: *EmbeddingAccelerator, tokens_u32: []const u32, out_grad: *FutharkArray2DF16, lr: f16, momentum: f16) AccelError!void {
+        const tokens_arr = try FutharkArray1DU32.newFromFlat(self.ctx, tokens_u32, tokens_u32.len);
+        defer tokens_arr.free(self.ctx);
+
+        var grad_w: ?*futhark.struct_futhark_f16_2d = null;
+        const rc1 = futhark.futhark_entry_embedding_backward(
+            self.ctx.ctx, &grad_w, tokens_arr.arr, out_grad.arr,
+        );
+        if (rc1 != 0) return AccelError.FutharkBackwardFailed;
+
+        var new_weight: ?*futhark.struct_futhark_f16_2d = null;
+        var new_velocity: ?*futhark.struct_futhark_f16_2d = null;
+        const lr_bits: u16 = @bitCast(lr);
+        const momentum_bits: u16 = @bitCast(momentum);
+        const rc2 = futhark.futhark_entry_embedding_update(
+            self.ctx.ctx, &new_weight, &new_velocity,
+            self.weight.arr, grad_w,
+            lr_bits, momentum_bits,
+            self.velocity.arr,
+        );
+        _ = futhark.futhark_free_f16_2d(self.ctx.ctx, grad_w);
+        if (rc2 != 0) return AccelError.FutharkUpdateFailed;
+
+        _ = futhark.futhark_free_f16_2d(self.ctx.ctx, self.weight.arr);
+        _ = futhark.futhark_free_f16_2d(self.ctx.ctx, self.velocity.arr);
+        self.weight.arr = new_weight;
+        self.velocity.arr = new_velocity;
+    }
+};
+
+pub const FutharkArray1DU32 = struct {
+    arr: ?*futhark.struct_futhark_u32_1d,
+    length: usize,
+
+    pub fn newFromFlat(ctx: *FutharkContext, data: []const u32, length: usize) AccelError!FutharkArray1DU32 {
+        var arr: ?*futhark.struct_futhark_u32_1d = null;
+        arr = futhark.futhark_new_u32_1d(ctx.ctx, data.ptr, @intCast(length));
+        if (arr == null) return AccelError.AllocationFailed;
+        return .{ .arr = arr, .length = length };
+    }
+
+    pub fn free(self: *const FutharkArray1DU32, ctx: *FutharkContext) void {
+        _ = futhark.futhark_free_u32_1d(ctx.ctx, self.arr);
+    }
+};
+```
+
+### 5.5 `src/distributed/distributed_trainer_futhark.zig` — embedding bedrótozás
+
+A `DistributedTrainerFuthark` struct-ot kiegészíteni:
+
+```zig
+pub const DistributedTrainerFuthark = struct {
+    // ... meglévő mezők ...
+    embedding: accel.EmbeddingAccelerator,  // ÚJ
+
+    pub fn initWithConfig(...) !DistributedTrainerFuthark {
+        // ... meglévő setup, vocab, tokenizer, accelerator ...
+
+        const embedding = try accel.EmbeddingAccelerator.init(
+            &accelerator.ctx,
+            tokenizer.next_token_id,  // vocab_size
+            actual_model_dim,         // dim
+            allocator,
+        );
+        errdefer embedding.deinit();
+
+        return .{
+            // ... meglévő mezők ...
+            .embedding = embedding,
+        };
+    }
+
+    pub fn deinit(self: *DistributedTrainerFuthark) void {
+        self.embedding.deinit();  // ÚJ
+        // ... meglévő deinit ...
+    }
+};
+```
+
+A `trainStep` (vagy ami a forward+backward loop-ot tartalmazza) átírni: a token IDs-t az embedding-en átvezetni, az embedding output-ját adni a RSF accelerator-nak, a RSF gradient-ot átadni az embedding backward-nak.
+
+A meglévő token-to-input konverziós helyen (jelenleg one-hot vagy direct token cast lehet):
+
+**Régi (példa):**
+```zig
+// token_ids → input_tensor (most one-hot vagy semmi)
+const input = try createInputFromTokens(token_ids, model_dim);
+```
+
+**Új:**
+```zig
+const input = try self.embedding.forward(token_ids, self.allocator);
+// 'input' egy FutharkArray2DF16 [seq_len, dim]
+```
+
+A backward-ben:
+```zig
+// RSF backward ad egy grad_input-ot a legalsó réteg után
+// → ez az embedding output gradiense
+try self.embedding.backwardAndUpdate(token_ids, &grad_input_at_embedding, @floatCast(self.learning_rate), @floatCast(self.momentum));
+```
+
+### 5.6 `src/api/inference_server.zig` — embedding inference path
+
+Az `InferenceServer` struct-ba:
+
+```zig
+pub const InferenceServer = struct {
+    // ... meglévő mezők ...
+    embedding: ?LearnedEmbedding = null,  // ÚJ (CPU side az inference-hez)
+
+    pub fn loadModel(self: *InferenceServer, path: []const u8) !void {
+        self.model = try importModel(path, self.allocator);
+        // ÚJ: embedding betöltése a model_io-n keresztül
+        var emb_path_buf: [256]u8 = undefined;
+        const emb_path = try std.fmt.bufPrint(&emb_path_buf, "{s}.embedding", .{path});
+        self.embedding = LearnedEmbedding.load(self.allocator, emb_path) catch null;
+
+        self.ssi = SSI.init(self.allocator);
+        self.ranker = try Ranker.init(self.allocator, 3, 8, 42);
+    }
+};
+```
+
+A `handleInference` (a `start` body-ban) bővítendő — lásd Phase 3.
+
+### 5.7 `src/core/model_io.zig` — embedding mentés
+
+A `ModelFormat`-hoz hozzáadni:
+```zig
+pub const ModelFormat = struct {
+    // ... meglévő mezők ...
+    embedding: ?*LearnedEmbedding = null,  // ÚJ
+
+    pub fn setEmbedding(self: *ModelFormat, emb: *LearnedEmbedding) void {
+        self.embedding = emb;
+    }
+};
+```
+
+Az `exportModel` és `importModel` mentse/töltse az embedding-et külön bináris fájlba `{path}.embedding`-ként, a `LearnedEmbedding.save` és `LearnedEmbedding.load` használatával.
+
+### 5.8 Tesztelés (Phase 2)
+
+```bash
+zig build test-embedding
+```
+
+**Új unit teszt `src/core/learned_embedding.zig` végére:**
+```zig
+test "LearnedEmbedding forward+backward roundtrip" {
+    const allocator = std.testing.allocator;
+    var emb = try LearnedEmbedding.init(allocator, 10, 4, 42);
+    defer emb.deinit();
+
+    const tokens = [_]u32{ 1, 3, 5 };
+    var out = try emb.forward(allocator, &tokens, 3);
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 12), out.data.len);
+
+    // Backward: send a known grad, check that emb.grad gets accumulated
+    var grad = [_]f32{ 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.25 };
+    emb.backward(&tokens, &grad, 3);
+    // Token 1 should have grad row [1, 1, 1, 1]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[1 * 4 + 0], 1e-6);
+}
+```
+
+**Phase 2 sikerkritériuma:** ez a teszt PASS és `zig build` zöld.
+
+---
+
+## 6. Fázis 3 — InferenceServer pipeline összerakása
+
+**Cél:** A `jaide-inference-server` egy teljes end-to-end inference pipeline-t fusson le request-enként.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/api/inference_server.zig` | `handleInference` átírás teljes pipeline-ra |
+| `src/inference_server_main.zig` | indítási paraméterek bővítése |
+
+### 6.1 `src/api/inference_server.zig` — `handleInference` átírás
+
+A jelenlegi `handleInference` (a `start` body-jában HTTP request-handler) bővítése. A teljes pipeline (lásd 2.1):
+
+```zig
+fn handleInference(self: *InferenceServer, request: *InferenceRequest, allocator: Allocator) !InferenceResponse {
+    self.inference_mutex.lock();
+    defer self.inference_mutex.unlock();
+
+    const model = self.model orelse return error.ModelNotLoaded;
+    const embedding = self.embedding orelse return error.EmbeddingNotLoaded;
+    const mgt = model.mgt orelse return error.MgtNotLoaded;
+    const rsf = model.rsf orelse return error.RsfNotLoaded;
+    const ssi = &(self.ssi orelse return error.SsiNotInit);
+    const ranker = &(self.ranker orelse return error.RankerNotInit);
+
+    // [1] MGT.encode
+    var token_list = std.ArrayList(u32).init(allocator);
+    defer token_list.deinit();
+    try mgt.encode(request.input, &token_list);
+    if (token_list.items.len == 0) return error.EmptyInput;
+
+    // Limit input length
+    const max_input_len = 256;
+    const input_tokens = if (token_list.items.len > max_input_len) token_list.items[0..max_input_len] else token_list.items;
+
+    // [2] LearnedEmbedding.forward
+    var activation = try embedding.forward(allocator, input_tokens, input_tokens.len);
+    defer activation.deinit();
+
+    // [3] RSF + OFTB forward (Phase 1 ensures OFTB is wired in)
+    try rsf.forward(&activation);
+
+    // [4] encodeInformation: activation → NSIR graph
+    var graph = try @import("../core_relational/nsir_core.zig").SelfSimilarRelationalGraph.init(allocator);
+    defer graph.deinit();
+    try encodeActivationToGraph(&graph, &activation, input_tokens);
+
+    // [5] CREV optional (skip in inference unless JAIDE_ENABLE_CREV=1)
+    // (Phase 4 deals with this)
+
+    // [6] ReasoningOrchestrator (Phase 5)
+    // (See Phase 5 — uncomment after Phase 5 is implemented)
+    // var orch = try ReasoningOrchestrator.init(allocator, &graph, &esso, &chaos);
+    // defer orch.deinit();
+    // _ = try orch.runHierarchicalReasoning();
+
+    // [7] SurpriseMemory (Phase 6)
+    // _ = try self.surprise_memory.consider(activation.data, &graph);
+
+    // [8] TemporalGraph (Phase 7)
+    // _ = try self.temporal_graph.snapshot(&graph);
+
+    // [9-10] SSI + Ranker
+    const k: usize = 32;
+    const candidates = try ssi.retrieveTopK(input_tokens, k, allocator);
+    defer allocator.free(candidates);
+
+    if (candidates.len == 0) {
+        // No candidates → just detokenize input as fallback
+        const out_text = try mgt.detokenize(input_tokens);
+        defer allocator.free(out_text);
+        return InferenceResponse{
+            .output = try allocator.dupe(u8, out_text),
+            .tokens_generated = 0,
+            .latency_ms = 0,
+        };
+    }
+
+    var ranked = try allocator.dupe(types.RankedSegment, candidates);
+    defer allocator.free(ranked);
+    try ranker.rankCandidatesWithQuery(ranked, input_tokens, ssi, allocator);
+
+    // [11] Best segment first token
+    const best = ranked[0];
+    const next_token_id: u32 = if (best.tokens.len > 0) best.tokens[0] else 0;
+
+    // [12] (Single-token generation for now; multi-token loop is Phase 11.)
+    const out_tokens = [_]u32{ next_token_id };
+
+    // [13] MGT.decode
+    const out_text = try mgt.detokenize(&out_tokens);
+    defer allocator.free(out_text);
+
+    return InferenceResponse{
+        .output = try allocator.dupe(u8, out_text),
+        .tokens_generated = 1,
+        .latency_ms = 0,
+    };
+}
+
+fn encodeActivationToGraph(
+    graph: *@import("../core_relational/nsir_core.zig").SelfSimilarRelationalGraph,
+    activation: *const Tensor,
+    tokens: []const u32,
+) !void {
+    const Node = @import("../core_relational/nsir_core.zig").Node;
+    const Qubit = @import("../core_relational/nsir_core.zig").Qubit;
+    const Complex = std.math.Complex;
+    const seq_len = if (activation.shape.len > 0) activation.shape[0] else tokens.len;
+    const dim = if (activation.shape.len > 1) activation.shape[1] else activation.data.len / seq_len;
+
+    var i: usize = 0;
+    while (i < seq_len) : (i += 1) {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "node_{d}", .{i});
+
+        // qubit components from activation: a = vector L2 norm, b = sqrt(1-a^2) ish
+        var sumsq: f32 = 0.0;
+        var k: usize = 0;
+        while (k < dim) : (k += 1) {
+            const v = activation.data[i * dim + k];
+            sumsq += v * v;
+        }
+        const norm = @sqrt(sumsq);
+        const a = @min(1.0, norm);
+        const b_real = @sqrt(@max(0.0, 1.0 - a * a));
+        const qubit = Qubit.init(
+            Complex(f64).init(@as(f64, a), 0.0),
+            Complex(f64).init(@as(f64, b_real), 0.0),
+        );
+        const phase = @as(f64, @floatFromInt(i)) * 0.1;
+        try graph.addNode(id, "", qubit, phase);
+
+        // Edge to previous node (sequential graph)
+        if (i > 0) {
+            var prev_buf: [32]u8 = undefined;
+            const prev_id = try std.fmt.bufPrint(&prev_buf, "node_{d}", .{i - 1});
+            try graph.addEdge(prev_id, id, 1.0, .coherent, Complex(f64).init(0.5, 0.0), 1.5);
+        }
+    }
+}
+```
+
+### 6.2 `src/inference_server_main.zig` — main bővítés
+
+A `main` függvény bővítése: olvasson `JAIDE_MODEL_PATH` env-et, hívja `loadModel`-t azzal.
+
+```zig
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const cfg = ServerConfig{
+        .host = "0.0.0.0",
+        .port = 8080,
+        .max_request_size_bytes = 1024 * 1024,
+        .require_api_key = std.posix.getenv("JAIDE_API_KEY") != null,
+        .rate_limit_per_minute = 60,
+    };
+
+    var server = try InferenceServer.init(allocator, cfg);
+    defer server.deinit();
+
+    if (std.posix.getenv("JAIDE_MODEL_PATH")) |model_path| {
+        try server.loadModel(model_path);
+        std.debug.print("Model loaded from: {s}\n", .{model_path});
+    } else {
+        std.debug.print("WARNING: JAIDE_MODEL_PATH not set, server will reject inference requests\n", .{});
+    }
+
+    try server.start();
+}
+```
+
+### 6.3 Tesztelés (Phase 3)
+
+```bash
+zig build
+./zig-out/bin/jaide-inference-server &
+SERVER_PID=$!
+sleep 1
+curl -X POST http://localhost:8080/inference \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "hello world"}'
+kill $SERVER_PID
+```
+
+Sikerkritérium: a HTTP request 200-zal tér vissza JSON body-val ami egy `output` mezőt tartalmaz, és a server nem crash-el.
+
+---
+
+## 7. Fázis 4 — CREV knowledge-graph builder
+
+**Cél:** A training dataset szöveg-mezőin a CREV pipeline triplet-eket nyer ki és felépíti a KnowledgeGraphIndex-et, ami opcionálisan beölthető az NSIR-be inference idején.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/core_relational/crev_pipeline.zig` | nincs változás, csak hívni |
+| `src/distributed/distributed_trainer_futhark.zig` | preprocessing fázist hozzáadni |
+| `src/core/model_io.zig` | KnowledgeGraphIndex serializáció |
+| `src/api/inference_server.zig` | KGI betöltés inference-időre |
+
+### 7.1 `src/distributed/distributed_trainer_futhark.zig` — preprocessing
+
+Új függvény `DistributedTrainerFuthark`-on:
+
+```zig
+pub fn buildKnowledgeGraph(self: *DistributedTrainerFuthark, dataset_path: []const u8) !void {
+    if (std.posix.getenv("JAIDE_BUILD_KG") == null) {
+        std.debug.print("[Rank {d}] JAIDE_BUILD_KG not set, skipping CREV preprocessing\n", .{self.coordinator.rank});
+        return;
+    }
+
+    const crev = @import("../core_relational/crev_pipeline.zig");
+    const chaos = @import("../core_relational/chaos_core.zig");
+
+    var chaos_kernel = try chaos.ChaosCoreKernel.init(self.allocator);
+    defer chaos_kernel.deinit();
+
+    var pipeline = try crev.CREVPipeline.init(self.allocator, &chaos_kernel);
+    defer pipeline.deinit();
+
+    const file = try openReadFile(dataset_path);
+    defer file.close();
+    var buf_reader = std.io.bufferedReader(file.reader());
+    var line_count: usize = 0;
+
+    while (try buf_reader.reader().readUntilDelimiterOrEofAlloc(self.allocator, '\n', self.config.max_line_size)) |line| {
+        defer self.allocator.free(line);
+        const maybe_text = try self.extractDatasetText(line);
+        if (maybe_text) |text| {
+            defer self.allocator.free(text);
+            try pipeline.processBatch(text);
+            line_count += 1;
+            if (line_count >= 1000) break; // Limit preprocessing time
+        }
+    }
+
+    // Save KGI to file
+    const kg_path = try std.fmt.allocPrint(self.allocator, "/tmp/jaide_kg_rank{d}.bin", .{self.coordinator.rank});
+    defer self.allocator.free(kg_path);
+    // pipeline.knowledge_index.save(kg_path) — feltéve hogy ezt a metódust hozzáadjuk
+
+    std.debug.print("[Rank {d}] CREV processed {d} lines\n", .{self.coordinator.rank, line_count});
+}
+```
+
+A `main_distributed_futhark.zig`-be a trainEpoch előtt hívni:
+```zig
+try trainer.buildKnowledgeGraph(dataset_path);
+```
+
+### 7.2 `src/core_relational/crev_pipeline.zig` — `KnowledgeGraphIndex.save/load`
+
+Ha még nincs `save`/`load` a `KnowledgeGraphIndex`-en, hozzáadni egy egyszerű bináris formátumot:
+```zig
+pub fn save(self: *KnowledgeGraphIndex, path: []const u8) !void {
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    var bw = std.io.bufferedWriter(file.writer());
+    const w = bw.writer();
+    try w.writeAll("CREVKG\x00");
+    try w.writeInt(u32, 1, .little); // version
+    try w.writeInt(u64, @intCast(self.triplets.items.len), .little);
+    for (self.triplets.items) |t| {
+        // (subject, relation, object, confidence)
+        try w.writeInt(u32, @intCast(t.subject.len), .little);
+        try w.writeAll(t.subject);
+        try w.writeInt(u32, @intCast(t.relation.len), .little);
+        try w.writeAll(t.relation);
+        try w.writeInt(u32, @intCast(t.object.len), .little);
+        try w.writeAll(t.object);
+        try w.writeInt(u64, @bitCast(t.confidence), .little);
+    }
+    try bw.flush();
+}
+```
+
+### 7.3 Tesztelés (Phase 4)
+
+```bash
+JAIDE_BUILD_KG=1 WORLD_SIZE=1 RANK=0 MASTER_ADDR=localhost MASTER_PORT=29500 \
+  ./zig-out/bin/jaide-distributed-futhark --dataset /path/to/small.jsonl
+ls -la /tmp/jaide_kg_rank0.bin   # ne legyen üres
+```
+
+Sikerkritérium: a `/tmp/jaide_kg_rank0.bin` exists és nem 0 byte. A training tovább fut (preprocessing csak külön fázis).
+
+---
+
+## 8. Fázis 5 — ReasoningOrchestrator inference végén
+
+**Cél:** A `runHierarchicalReasoning` az inference végén lefut, addig iterál amíg `E_combined < 0.01`.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/api/inference_server.zig` | `InferenceServer`-be ESSO, Chaos, Orchestrator bedrótozása |
+| (semmi más változtatás a *.zig fájlokban a core_relational alatt) |
+
+### 8.1 `src/api/inference_server.zig`
+
+```zig
+pub const InferenceServer = struct {
+    // ... meglévő mezők ...
+    chaos_kernel: ?@import("../core_relational/chaos_core.zig").ChaosCoreKernel = null,
+    esso: ?@import("../core_relational/esso_optimizer.zig").EntangledStochasticSymmetryOptimizer = null,
+
+    pub fn init(allocator: Allocator, config: ServerConfig) !InferenceServer {
+        // ... meglévő setup ...
+
+        const chaos = @import("../core_relational/chaos_core.zig");
+        const esso_mod = @import("../core_relational/esso_optimizer.zig");
+
+        var chaos_kernel = try chaos.ChaosCoreKernel.init(allocator);
+        errdefer chaos_kernel.deinit();
+        const esso = try esso_mod.EntangledStochasticSymmetryOptimizer.init(allocator);
+        errdefer esso.deinit();
+
+        return InferenceServer{
+            // ... meglévő mezők ...
+            .chaos_kernel = chaos_kernel,
+            .esso = esso,
+        };
+    }
+};
+```
+
+A `handleInference`-ben (Phase 3-ban hagyott `[6]` szakasz):
+
+```zig
+// [6] ReasoningOrchestrator
+const reasoning = @import("../core_relational/reasoning_orchestrator.zig");
+var orch = try reasoning.ReasoningOrchestrator.init(
+    allocator,
+    &graph,
+    &(self.esso orelse return error.EssoNotInit),
+    &(self.chaos_kernel orelse return error.ChaosNotInit),
+);
+defer orch.deinit();
+const final_energy = try orch.runHierarchicalReasoning();
+std.debug.print("[Inference] Reasoning energy: {d}\n", .{final_energy});
+```
+
+**FONTOS:** ha `runHierarchicalReasoning` nincs még implementálva (csak `executeLocalPhase` van), akkor a `reasoning_orchestrator.zig`-ben hozzáadni:
+
+```zig
+pub fn runHierarchicalReasoning(self: *Self) !f64 {
+    const max_iters: usize = 50;
+    var iter: usize = 0;
+    while (iter < max_iters) : (iter += 1) {
+        const local = try self.executeLocalPhase();
+        const global = try self.executeGlobalPhase();
+        const meta = try self.executeMetaPhase();
+        const combined = (local + global + meta) / 3.0;
+        if (combined < 0.01) return combined;
+    }
+    return error.ReasoningDidNotConverge;
+}
+```
+
+### 8.2 Tesztelés (Phase 5)
+
+`src/core_relational/reasoning_orchestrator.zig` végére:
+
+```zig
+test "ReasoningOrchestrator converges on small graph" {
+    const allocator = std.testing.allocator;
+    var graph = try SelfSimilarRelationalGraph.init(allocator);
+    defer graph.deinit();
+    // Add 4 nodes, 6 edges
+    // ...
+    var chaos_kernel = try ChaosCoreKernel.init(allocator);
+    defer chaos_kernel.deinit();
+    var esso = try EntangledStochasticSymmetryOptimizer.init(allocator);
+    defer esso.deinit();
+
+    var orch = try ReasoningOrchestrator.init(allocator, &graph, &esso, &chaos_kernel);
+    defer orch.deinit();
+    const energy = try orch.runHierarchicalReasoning();
+    try std.testing.expect(energy < 0.01);
+}
+```
+
+Sikerkritérium: a teszt PASS.
+
+---
+
+## 9. Fázis 6 — SurpriseMemory KV-cache alternatíva
+
+**Cél:** A `SurpriseMemoryManager` egy `MemoryBlock`-okat tároló cache, ami a magas surprise (`(jaccard+hash+temporal)/3`) bemeneteket preferálja.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/api/inference_server.zig` | SurpriseMemoryManager bedrótozás |
+| `src/core_relational/surprise_memory.zig` | feltöltés `consider` API (lásd 9.2) |
+
+### 9.1 `src/api/inference_server.zig`
+
+```zig
+pub const InferenceServer = struct {
+    // ... meglévő mezők ...
+    surprise_memory: ?*@import("../core_relational/surprise_memory.zig").SurpriseMemoryManager = null,
+    cas_storage: ?*@import("../core_relational/chaos_core.zig").ContentAddressableStorage = null,
+    dataflow_analyzer: ?*@import("../core_relational/chaos_core.zig").DataFlowAnalyzer = null,
+
+    pub fn init(...) !InferenceServer {
+        // ... meglévő setup ...
+        const chaos = @import("../core_relational/chaos_core.zig");
+        const surprise = @import("../core_relational/surprise_memory.zig");
+
+        const cas = try allocator.create(chaos.ContentAddressableStorage);
+        cas.* = try chaos.ContentAddressableStorage.init(allocator);
+        errdefer { cas.deinit(); allocator.destroy(cas); }
+
+        const analyzer = try allocator.create(chaos.DataFlowAnalyzer);
+        analyzer.* = try chaos.DataFlowAnalyzer.init(allocator);
+        errdefer { analyzer.deinit(); allocator.destroy(analyzer); }
+
+        const sm = try allocator.create(surprise.SurpriseMemoryManager);
+        sm.* = surprise.SurpriseMemoryManager.init(allocator, cas, analyzer);
+
+        return .{
+            // ... meglévő mezők ...
+            .surprise_memory = sm,
+            .cas_storage = cas,
+            .dataflow_analyzer = analyzer,
+        };
+    }
+};
+```
+
+A `handleInference`-ben (Phase 3-ban hagyott `[7]` szakasz):
+```zig
+// [7] SurpriseMemory: consider az activation-t mint új blokk
+if (self.surprise_memory) |sm| {
+    const activation_bytes = std.mem.sliceAsBytes(activation.data);
+    const metrics = try sm.computeSurprise(activation_bytes);
+    if (metrics.exceedsThreshold(sm.getSurpriseThreshold())) {
+        // High surprise → store as new block
+        // (sm.addBlock vagy hasonló)
+    }
+}
+```
+
+### 9.2 `src/core_relational/surprise_memory.zig` — `addBlock` és `consider` API
+
+Ha nincs `addBlock` metódus, hozzáadni:
+```zig
+pub fn addBlock(self: *Self, content: []const u8, metrics: SurpriseMetrics) !void {
+    const score = (metrics.jaccard + metrics.hash_dist + metrics.temporal) / 3.0;
+    const block_id = computeBlockId(content); // SHA-256 alapú
+    var record = SurpriseRecord.init(block_id, score);
+    record.recordAccess();
+    try self.records.put(block_id, record);
+    // CAS storage
+    try self.storage.put(block_id, content);
+    self.statistics.addBlock(score, self.surprise_threshold);
+}
+```
+
+### 9.3 Tesztelés (Phase 6)
+
+`src/core_relational/surprise_memory.zig` végére:
+```zig
+test "SurpriseMemoryManager eviction" {
+    const allocator = std.testing.allocator;
+    // (init storage, analyzer, manager)
+    var sm = try ...;
+    defer sm.deinit();
+
+    const block1 = "low surprise content";
+    const block2 = "high surprise content!!!";
+    // ... compute metrics, add blocks ...
+
+    sm.setSurpriseThreshold(0.5);
+    try sm.evictLowSurpriseBlocks();
+    // Verify low-surprise is evicted, high-surprise retained
+}
+```
+
+Sikerkritérium: a teszt PASS.
+
+---
+
+## 10. Fázis 7 — TemporalGraph snapshotting
+
+**Cél:** Minden NSIR állapotváltozás nanosec timestamp-pel jelölt, és lehet `getVersionAt(timestamp)` lekérdezést végezni.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/api/inference_server.zig` | TemporalGraph bedrótozás |
+| `src/core_relational/temporal_graph.zig` | nincs változás, csak hívni |
+
+### 10.1 `src/api/inference_server.zig`
+
+```zig
+pub const InferenceServer = struct {
+    // ... meglévő mezők ...
+    temporal_graph: ?*@import("../core_relational/temporal_graph.zig").TemporalGraph = null,
+};
+```
+
+A `handleInference`-ben (Phase 3-ban hagyott `[8]` szakasz):
+```zig
+// [8] TemporalGraph: snapshot az aktuális gráfot
+if (self.temporal_graph) |tg| {
+    try tg.snapshotFromGraph(&graph, std.time.nanoTimestamp());
+}
+```
+
+### 10.2 Tesztelés (Phase 7)
+
+```zig
+test "TemporalGraph round-trip" {
+    const allocator = std.testing.allocator;
+    var tg = try TemporalGraph.init(allocator);
+    defer tg.deinit();
+
+    var graph1 = try SelfSimilarRelationalGraph.init(allocator);
+    defer graph1.deinit();
+    try graph1.addNode("n1", "", Qubit.initBasis0(), 0.0);
+
+    const ts1 = std.time.nanoTimestamp();
+    try tg.snapshotFromGraph(&graph1, ts1);
+
+    var graph2 = try SelfSimilarRelationalGraph.init(allocator);
+    defer graph2.deinit();
+    try graph2.addNode("n2", "", Qubit.initBasis1(), 1.0);
+
+    const ts2 = std.time.nanoTimestamp();
+    try tg.snapshotFromGraph(&graph2, ts2);
+
+    // getVersionAt(ts1) → "n1" node ott van
+    // getVersionAt(ts2) → "n2" node ott van
+}
+```
+
+---
+
+## 11. Fázis 8 — Verifikációs réteg (opcionális, `JAIDE_VERIFY=1`)
+
+**Cél:** Minden inference-re Pedersen commitment + TypeTheory check + FormalVerification + ZkVerification + Merkle audit trail.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/api/inference_server.zig` | `VerifiedInferenceEngine` bedrótozás |
+| `src/core_relational/verified_inference_engine.zig` | nincs változás |
+| `src/core_relational/type_theory.zig` | nincs változás (csak hívni) |
+| `src/core_relational/formal_verification.zig` | nincs változás (csak hívni) |
+| `src/core_relational/zk_verification.zig` | nincs változás |
+| `src/core_relational/security_proofs.zig` | audit log fájl appendelés |
+
+### 11.1 `src/api/inference_server.zig`
+
+```zig
+pub const InferenceServer = struct {
+    // ...
+    verifier: ?*@import("../core_relational/verified_inference_engine.zig").VerifiedInferenceEngine = null,
+
+    pub fn init(...) !InferenceServer {
+        const verify_enabled = std.posix.getenv("JAIDE_VERIFY") != null;
+        var verifier: ?*VerifiedInferenceEngine = null;
+        if (verify_enabled) {
+            verifier = try VerifiedInferenceEngine.initWithZKProofs(allocator);
+            errdefer verifier.?.deinit();
+        }
+        return .{ /* ... */, .verifier = verifier };
+    }
+};
+```
+
+A `handleInference` legvégén (a return előtt):
+
+```zig
+if (self.verifier) |v| {
+    const audit_log_path = std.posix.getenv("JAIDE_AUDIT_LOG") orelse "/tmp/jaide_audit.log";
+    const input_bytes = request.input;
+    const output_bytes = response.output;
+    try v.performVerifiedInference(input_bytes, output_buf);
+    // append audit entry to file
+    var f = try std.fs.cwd().createFile(audit_log_path, .{ .truncate = false });
+    defer f.close();
+    try f.seekFromEnd(0);
+    try f.writer().print("{{\"timestamp\":{d},\"input\":\"{s}\",\"output\":\"{s}\"}}\n", .{
+        std.time.nanoTimestamp(), input_bytes, output_bytes,
+    });
+}
+```
+
+### 11.2 Tesztelés (Phase 8)
+
+```bash
+JAIDE_VERIFY=1 JAIDE_AUDIT_LOG=/tmp/test_audit.log ./zig-out/bin/jaide-inference-server &
+sleep 1
+curl -X POST http://localhost:8080/inference -d '{"input":"test"}'
+cat /tmp/test_audit.log  # van benne egy JSON-line entry
+```
+
+---
+
+## 12. Fázis 9 — FractalLPU + RGPU + Quantum integráció
+
+**Cél:** A `FractalLPU` az ESSO-ban gyorsítja a fractal-dimension számításokat. Az `RGPU` mint elosztott graph-processzor választható (`JAIDE_RGPU=1`). A `QuantumHardware` mock-ol 5 IBM backend-et.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/core_relational/esso_optimizer.zig` | FractalLPU optional dependency |
+| `src/core_relational/r_gpu.zig` | nincs változás (csak hívni) |
+| `src/api/inference_server.zig` | RGPU opcionális init |
+| `src/core_relational/quantum_task_adapter.zig` | nincs változás |
+| `src/core_relational/quantum_hardware.zig` | nincs változás |
+| `src/core_relational/ibm_quantum.zig` | nincs változás |
+
+### 12.1 `src/core_relational/esso_optimizer.zig`
+
+Hozzáadni egy opcionális `fractal_lpu: ?*FractalLPU` mezőt az `EntangledStochasticSymmetryOptimizer`-hez. A `computeEnergy` használja, ha be van állítva.
+
+### 12.2 `src/api/inference_server.zig`
+
+```zig
+pub const InferenceServer = struct {
+    // ...
+    rgpu: ?*RGPU = null,
+    fractal_lpu: ?*FractalLPU = null,
+
+    pub fn init(...) !InferenceServer {
+        // ...
+        const rgpu_enabled = std.posix.getenv("JAIDE_RGPU") != null;
+        const rgpu: ?*RGPU = if (rgpu_enabled) try RGPU.init(allocator, 4, 4) else null;  // 4x4 NoC mesh
+        const flpu: ?*FractalLPU = try FractalLPU.init(allocator);
+        // Wire flpu into esso
+        if (esso.fractal_lpu == null) esso.fractal_lpu = flpu;
+        // ...
+    }
+};
+```
+
+---
+
+## 13. Fázis 10 — SignalPropagation + ZRuntime audit
+
+**Cél:** A `SignalPropagationEngine` komplex hullámként terjeszti az aktivációt az NSIR éleken (`amplitude × e^iphase`). A `ZRuntime` minden inference-et logol.
+
+**Érintett fájlok:**
+
+| Fájl | Müvelet |
+|------|---------|
+| `src/api/inference_server.zig` | SignalPropagationEngine + ZRuntime bedrótozás |
+
+### 13.1 `src/api/inference_server.zig`
+
+A `handleInference`-ben, a [6] (ReasoningOrchestrator) UTÁN:
+```zig
+// SignalPropagation: complex wave through graph
+const sp = @import("../core_relational/signal_propagation.zig");
+var prop_engine = sp.SignalPropagationEngine.init(allocator, &graph, self.dataflow_analyzer.?);
+defer prop_engine.deinit();
+const initial_signal = sp.SignalState.init(1.0, 0.0, 1.0);  // amp=1, phase=0, freq=1
+try prop_engine.initiateSignal("node_0", initial_signal);
+try prop_engine.propagateMultipleSteps(10);
+
+// ZRuntime: log this inference
+const zr = @import("../core_relational/z_runtime.zig");
+if (self.z_runtime) |z| {
+    try z.logInference(request.input, response.output);
+}
+```
+
+---
+
+## 14. Fázis 11 — Final build, test, benchmark, PR
+
+```bash
+# 1. Build mindent
+zig build clean
+zig build
+
+# 2. Run all unit tests
+zig build test-all
+
+# 3. Smoke test inference server
+./zig-out/bin/jaide-inference-server &
+sleep 1
+curl -X POST http://localhost:8080/inference -d '{"input":"the quick brown fox"}'
+kill %1
+
+# 4. (Csak ha GPU) Run distributed trainer smoke
+WORLD_SIZE=1 RANK=0 MASTER_ADDR=localhost MASTER_PORT=29500 \
+  JAIDE_MODEL_DIM=128 JAIDE_LAYERS=4 JAIDE_BATCH_SIZE=2 JAIDE_EPOCHS=1 \
+  ./zig-out/bin/jaide-distributed-futhark
+
+# 5. Benchmark
+zig build bench
+
+# 6. Commit + PR
+git checkout -b devin/full-architecture-wiring
+git add -A
+git commit -m "Full architecture wiring: OFTB + LearnedEmbedding + CREV + Reasoning + Surprise + Temporal + Verified
+
+- Phase 1: OFTB butterfly after each RSF coupling (Zig + Futhark)
+- Phase 2: LearnedEmbedding activated in training and inference
+- Phase 3: InferenceServer full pipeline (MGT → LE → RSF+OFTB → SSI → NSIR → ReasoningOrchestrator → SurpriseMemory → Ranker → MGT)
+- Phase 4: CREV knowledge-graph builder during training preprocessing
+- Phase 5: ReasoningOrchestrator runs to E_combined < 0.01
+- Phase 6: SurpriseMemoryManager as KV-cache alternative
+- Phase 7: TemporalGraph snapshots every NSIR state change
+- Phase 8: VerifiedInferenceEngine wraps inference when JAIDE_VERIFY=1
+- Phase 9: FractalLPU + RGPU + QuantumTaskAdapter optional wiring
+- Phase 10: SignalPropagationEngine + ZRuntime audit log
+- Phase 11: All 59 files now coherently wired
+
+All sikerkritérium met:
+- zig build green
+- RSF + OFTB reversibility test PASS at 1e-4
+- Inference end-to-end works
+- Training end-to-end works
+- ReasoningOrchestrator converges
+"
+git push -u origin devin/full-architecture-wiring
+gh pr create --title "JAIDE v40: Full architecture wiring (59 files)" --body "Resolves #N — wires all dormant modules into active training/inference paths."
+```
+
+---
+
+## 15. Kockázatok és nyitott kérdések
+
+1. **Futhark u32_1d:** ha a `futhark_new_u32_1d` és `futhark_free_u32_1d` C-függvények nem léteznek a generált `futhark_kernels.c`-ben, akkor a Futhark szótár konvertálandó: `u32` helyett `i64`-ot használunk a token-listának, és a Zig oldalon castolunk. Az `embedding_forward` változatlanul működik `i64`-gyel is.
+
+2. **ChaosCoreKernel init signature:** ha az `init` igényli a `ContentAddressableStorage`-t paraméterként, akkor azt először létrehozni. A Replit agent ellenőrizze a tényleges signature-t (`grep "pub fn init" src/core_relational/chaos_core.zig`).
+
+3. **CREVPipeline `processBatch` mock vagy valódi?** Lehet, hogy a `RelationPattern`-ek nincsenek feltöltve a vocab-bal. Ha igen, akkor egy default pattern-set kellhet (pl. `\s+is\s+a\s+`, `\s+has\s+a\s+`, etc.).
+
+4. **`reasoning_orchestrator.zig` jelenleg `executeGlobalPhase` és `executeMetaPhase` nem feltétlen pub.** Ha private-ok, pub-osítani. Vagy egy belső loop `runHierarchicalReasoning`-ben.
+
+5. **NSIR `addNode` API:** ellenőrizni a tényleges signature-t. Lehet, hogy `addNode(id, data, qubit, phase)` vagy `addNode(node: Node)`.
+
+6. **`model_io.zig` v6 format:** az embedding bevezetésekor új verzió kell. Régi v5 checkpointot egy migrációs script-tel konvertálni, vagy reset.
+
+7. **`zig build test-*` a core_relational fájlokra:** lehet hogy a fájl-szintű unit teszt nem futtatható, mert dependency-k nem találhatók. Ekkor a teszteket integrálni az `inference_server.zig` vagy a `_bench_deps.zig`-ba és onnan futtatni.
+
+8. **CUDA-mentes Linux/macOS lokális dev:** csak a `jaide-inference-server` épül CPU-ban. A `jaide-distributed-futhark` GPU-only.
+
+---
+
+## 16. Replit agent végrehajtási lépéssorrend (rövidített)
+
+A Replit agent ezeket a parancsokat futtassa sorban. Minden lépés után **STOP** és ellenőrzés.
+
+```bash
+# Lépés 0: clone + setup
+git clone https://github.com/kollarsandor/jaidellm.git
+cd jaidellm
+git checkout main
+git checkout -b devin/full-architecture-wiring
+zig build  # baseline ellenőrzés
+
+# Lépés 1: Phase 1 (OFTB)
+# - Szerkeszd src/hw/accel/main.fut (lásd 4.1)
+# - Regeneráld a C kódot: futhark c src/hw/accel/main.fut -o src/hw/accel/futhark_kernels.c
+# - Szerkeszd src/hw/accel/futhark_bindings.zig (lásd 4.2)
+# - Szerkeszd src/hw/accel/accel_interface.zig (lásd 4.3, 4.4)
+# - Szerkeszd src/processor/rsf.zig (lásd 4.5)
+# - zig build  → ellenőrzés
+# - zig build test-rsf  → reverzibilitás teszt zöld
+# - git commit -m "Phase 1: OFTB butterfly wired into RSF (Zig + Futhark)"
+
+# Lépés 2: Phase 2 (LearnedEmbedding)
+# (lásd 5.1-5.7)
+# - zig build test-embedding
+# - git commit -m "Phase 2: LearnedEmbedding wired into training+inference"
+
+# Lépés 3-11: Phase 3-11 hasonlóan
+# Minden Phase végén:
+# - zig build → zöld
+# - tesztek zöldek
+# - git commit -m "Phase N: ..."
+
+# Lépés 12: PR
+git push -u origin devin/full-architecture-wiring
+gh pr create --title "JAIDE v40: Full architecture wiring (59 files)" \
+  --body "$(cat IMPLEMENTATION_PLAN.md | head -80)"
+```
+
+---
+
+**Végső checklist (a végén mindennek pipálva kell lennie):**
+
+- [ ] Phase 1: OFTB + RSF wired, reverzibilitás teszt PASS
+- [ ] Phase 2: LearnedEmbedding wired, embedding teszt PASS
+- [ ] Phase 3: InferenceServer pipeline curl-vel működik
+- [ ] Phase 4: CREV preprocessing /tmp/jaide_kg_*.bin generálva
+- [ ] Phase 5: ReasoningOrchestrator E_combined < 0.01 a tesztben
+- [ ] Phase 6: SurpriseMemory eviction teszt PASS
+- [ ] Phase 7: TemporalGraph round-trip teszt PASS
+- [ ] Phase 8: JAIDE_VERIFY=1 mellett /tmp/jaide_audit.log feltöltődik
+- [ ] Phase 9: JAIDE_RGPU=1 mellett az inference fut és nem crash-el
+- [ ] Phase 10: SignalPropagation + ZRuntime audit log működik
+- [ ] Phase 11: PR létrehozva, CI zöld
+
+Ha bármelyik phase failed, a Replit agent álljon meg és jelentse vissza, ne ugorjon a következőre.
